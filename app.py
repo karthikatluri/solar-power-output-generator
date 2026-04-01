@@ -3,17 +3,13 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import joblib
-import os
+import warnings
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-import xgboost as xgb
 from xgboost import XGBRegressor
-import warnings
-import statsmodels.api as sm
 
 warnings.filterwarnings("ignore")
 
@@ -29,9 +25,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&display=swap');
-
     html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
-
     .main-title {
         font-size: 2.6rem; font-weight: 700;
         background: linear-gradient(135deg, #f59e0b, #ef4444);
@@ -39,7 +33,6 @@ st.markdown("""
         margin-bottom: 0.2rem;
     }
     .subtitle { color: #6b7280; font-size: 1rem; margin-bottom: 1.5rem; }
-
     .metric-card {
         background: linear-gradient(135deg, #1e293b, #0f172a);
         border: 1px solid #334155; border-radius: 12px;
@@ -48,16 +41,10 @@ st.markdown("""
     .metric-label { color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; }
     .metric-value { color: #f8fafc; font-size: 1.8rem; font-weight: 700; }
     .metric-sub   { color: #64748b; font-size: 0.75rem; }
-
     .section-header {
         font-size: 1.3rem; font-weight: 600; color: #f1f5f9;
         border-left: 4px solid #f59e0b; padding-left: 0.75rem;
         margin: 1.5rem 0 1rem 0;
-    }
-    .best-badge {
-        background: linear-gradient(135deg, #f59e0b, #ef4444);
-        color: white; padding: 0.2rem 0.7rem; border-radius: 99px;
-        font-size: 0.75rem; font-weight: 600;
     }
     .stButton > button {
         background: linear-gradient(135deg, #f59e0b, #ef4444);
@@ -89,31 +76,61 @@ def load_data(uploaded_file):
     df = pd.read_csv(uploaded_file)
     return df
 
+
 @st.cache_data
 def preprocess(df):
     df = df.copy()
-    df['average-wind-speed-(period)'].fillna(df['average-wind-speed-(period)'].mean(), inplace=True)
-    df.drop_duplicates(inplace=True)
 
+    # ── 1. Fill missing values (no inplace on cached objects) ──────────────
+    for col in df.columns:
+        if df[col].dtype in [np.float64, np.int64, float, int]:
+            df[col] = df[col].fillna(df[col].mean())
+
+    # ── 2. Drop duplicates ──────────────────────────────────────────────────
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    # ── 3. Replace inf/-inf with NaN then re-fill ──────────────────────────
+    df = df.replace([np.inf, -np.inf], np.nan)
+    for col in df.select_dtypes(include=[np.number]).columns:
+        df[col] = df[col].fillna(df[col].median())
+
+    # ── 4. Cap outliers with IQR ───────────────────────────────────────────
     def cap_outliers(series):
         Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
         IQR = Q3 - Q1
-        lo, hi = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
-        return series.clip(lo, hi)
+        return series.clip(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
 
-    for col in df.select_dtypes(['int', 'float']).columns:
+    for col in df.select_dtypes(include=[np.number]).columns:
         df[col] = cap_outliers(df[col])
+
+    # ── 5. Final safety pass: drop any row still containing NaN ───────────
+    df = df.dropna(subset=FEATURES + [TARGET]).reset_index(drop=True)
+
     return df
+
 
 @st.cache_resource
 def train_models(df):
-    X = df[FEATURES]
-    y = df[TARGET]
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X = df[FEATURES].copy()
+    y = df[TARGET].copy()
+
+    # ── Guard: ensure no NaN / inf reaches sklearn ─────────────────────────
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(X.median())
+    y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
+
+    # Final numpy-level guard
+    X_train_s = np.nan_to_num(X_train_s, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test_s  = np.nan_to_num(X_test_s,  nan=0.0, posinf=0.0, neginf=0.0)
+    y_train   = np.nan_to_num(np.array(y_train, dtype=float), nan=0.0)
+    y_test_arr = np.nan_to_num(np.array(y_test,  dtype=float), nan=0.0)
 
     models = {
         "Decision Tree":     DecisionTreeRegressor(random_state=42),
@@ -126,14 +143,15 @@ def train_models(df):
     for name, model in models.items():
         model.fit(X_train_s, y_train)
         pred = model.predict(X_test_s)
-        predictions[name] = (y_test, pred)
+        predictions[name] = (y_test_arr, pred)
         results[name] = {
-            "R2":   round(r2_score(y_test, pred), 4),
-            "RMSE": round(np.sqrt(mean_squared_error(y_test, pred)), 2),
-            "MAE":  round(mean_absolute_error(y_test, pred), 2),
+            "R2":   round(r2_score(y_test_arr, pred), 4),
+            "RMSE": round(float(np.sqrt(mean_squared_error(y_test_arr, pred))), 2),
+            "MAE":  round(float(mean_absolute_error(y_test_arr, pred)), 2),
         }
 
     return models, scaler, results, predictions, X_test_s
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -170,12 +188,18 @@ if uploaded is None:
                 <div class="metric-sub">R² Score</div>
                 <div class="metric-sub">RMSE: {row['RMSE']:,.0f} &nbsp;|&nbsp; MAE: {row['MAE']:,.0f}</div>
             </div>""", unsafe_allow_html=True)
-
     st.stop()
 
 # ── Load & preprocess ─────────────────────────────────────────────────────────
-df_raw  = load_data(uploaded)
-df      = preprocess(df_raw)
+df_raw = load_data(uploaded)
+
+# Validate required columns exist
+missing_cols = [c for c in FEATURES + [TARGET] if c not in df_raw.columns]
+if missing_cols:
+    st.error(f"❌ Dataset is missing required columns: `{missing_cols}`")
+    st.stop()
+
+df = preprocess(df_raw)
 
 # ════════════════════════════════════════════════════════════════════
 # PAGE: OVERVIEW
@@ -220,8 +244,9 @@ if page == "🏠 Overview":
 # PAGE: EDA
 # ════════════════════════════════════════════════════════════════════
 elif page == "📊 EDA":
-    st.markdown('<div class="section-header">📊 Feature Distributions</div>', unsafe_allow_html=True)
     num_cols = FEATURES + [TARGET]
+
+    st.markdown('<div class="section-header">📊 Feature Distributions</div>', unsafe_allow_html=True)
     fig, axes = plt.subplots(3, 4, figsize=(16, 10))
     fig.patch.set_facecolor('#0f172a')
     for ax, col in zip(axes.flatten(), num_cols):
@@ -240,8 +265,7 @@ elif page == "📊 EDA":
     ax2.set_facecolor('#1e293b')
     corr = df[num_cols].corr()
     sns.heatmap(corr, annot=True, fmt=".2f", cmap='RdYlGn', ax=ax2,
-                linewidths=0.5, annot_kws={'size': 8},
-                cbar_kws={'shrink': 0.8})
+                linewidths=0.5, annot_kws={'size': 8}, cbar_kws={'shrink': 0.8})
     ax2.tick_params(colors='white', labelsize=9)
     ax2.set_title("Correlation Matrix", color='white', fontsize=14)
     st.pyplot(fig2)
@@ -298,7 +322,6 @@ elif page == "🤖 Model Training":
                 <div class="metric-sub">MAE: {row['MAE']:,.0f}</div>
             </div>""", unsafe_allow_html=True)
 
-    # R2 bar chart
     st.markdown("")
     fig_bar, ax_bar = plt.subplots(figsize=(9, 4))
     fig_bar.patch.set_facecolor('#0f172a')
@@ -316,19 +339,18 @@ elif page == "🤖 Model Training":
     for spine in ax_bar.spines.values(): spine.set_edgecolor('#334155')
     st.pyplot(fig_bar)
 
-    # Per-model diagnostic plots
     st.markdown('<div class="section-header">🔍 Diagnostic Plots per Model</div>', unsafe_allow_html=True)
     model_choice = st.selectbox("Select model to inspect", list(predictions.keys()))
 
-    y_test, y_pred = predictions[model_choice]
-    residuals = y_test - y_pred
+    y_test_arr, y_pred = predictions[model_choice]
+    residuals = y_test_arr - y_pred
 
     c1, c2 = st.columns(2)
     with c1:
         fig_sc, ax_sc = plt.subplots(figsize=(6, 4))
         fig_sc.patch.set_facecolor('#0f172a'); ax_sc.set_facecolor('#1e293b')
-        ax_sc.scatter(y_test, y_pred, alpha=0.4, s=10, color='#f59e0b')
-        mn, mx = min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())
+        ax_sc.scatter(y_test_arr, y_pred, alpha=0.4, s=10, color='#f59e0b')
+        mn, mx = min(y_test_arr.min(), y_pred.min()), max(y_test_arr.max(), y_pred.max())
         ax_sc.plot([mn, mx], [mn, mx], 'r--', lw=1.5)
         ax_sc.set_xlabel("Actual", color='white'); ax_sc.set_ylabel("Predicted", color='white')
         ax_sc.set_title(f"{model_choice}: Actual vs Predicted", color='white')
@@ -349,7 +371,7 @@ elif page == "🤖 Model Training":
 
     fig_line, ax_line = plt.subplots(figsize=(13, 4))
     fig_line.patch.set_facecolor('#0f172a'); ax_line.set_facecolor('#1e293b')
-    ax_line.plot(y_test.values[:150], label="Actual", color='#f59e0b', lw=1.5)
+    ax_line.plot(y_test_arr[:150], label="Actual", color='#f59e0b', lw=1.5)
     ax_line.plot(y_pred[:150], label="Predicted", color='#38bdf8', lw=1.5, alpha=0.85)
     ax_line.set_title(f"{model_choice}: Actual vs Predicted (first 150 samples)", color='white')
     ax_line.set_xlabel("Index", color='white'); ax_line.set_ylabel("Power Generated", color='white')
@@ -369,7 +391,6 @@ elif page == "🔮 Predict":
         models, scaler, results, predictions, _ = train_models(df)
 
     gb_model = models["Gradient Boosting"]
-
     stats = df[FEATURES].describe()
 
     with st.form("predict_form"):
@@ -378,8 +399,8 @@ elif page == "🔮 Predict":
         feat_cols = [c1, c2, c3, c1, c2, c3, c1, c2, c3]
         for feat, col in zip(FEATURES, feat_cols):
             with col:
-                mn = float(stats.loc['min', feat])
-                mx = float(stats.loc['max', feat])
+                mn  = float(stats.loc['min', feat])
+                mx  = float(stats.loc['max', feat])
                 med = float(stats.loc['50%', feat])
                 inputs[feat] = st.number_input(feat, min_value=mn, max_value=mx, value=med, format="%.4f")
 
@@ -388,6 +409,7 @@ elif page == "🔮 Predict":
     if submitted:
         input_df = pd.DataFrame([inputs])
         input_scaled = scaler.transform(input_df)
+        input_scaled = np.nan_to_num(input_scaled, nan=0.0, posinf=0.0, neginf=0.0)
         prediction = gb_model.predict(input_scaled)[0]
 
         st.markdown(f"""
